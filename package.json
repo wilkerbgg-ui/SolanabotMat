@@ -1,39 +1,18 @@
 {
-  "name": "solana-bot",
+  "name": "solarb-license-server",
   "version": "1.0.0",
-  "description": "SOL·ARB Solana arbitrage bot",
-  "main": "index.ts",
+  "main": "server.js",
   "scripts": {
-    "dev":   "tsx watch index.ts",
-    "start": "tsx index.ts",
-    "build": "tsc --project tsconfig.build.json",
-    "pkg":   "npm run build && pkg dist/index.js --targets node18-win-x64,node18-linux-x64 --output dist/SOLARB --compress GZip"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@jup-ag/api":          "^6.0.29",
-    "@solana/spl-token":    "^0.4.9",
-    "@solana/web3.js":      "^1.98.0",
-    "bs58":                 "^6.0.0",
-    "dotenv":               "^17.3.1",
-    "express":              "^4.21.2",
-    "express-rate-limit":   "^7.5.1",
-    "socket.io":            "^4.8.1"
-  },
-  "optionalDependencies": {
-    "better-sqlite3": "^11.10.0"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/bs58":           "^4.0.4",
-    "@types/express":        "^5.0.1",
-    "@types/node":           "^22.14.0",
-    "pkg":                   "^5.8.1",
-    "tsx":                   "^4.19.3",
-    "typescript":            "^5.8.3"
-  },
-  "pkg": {
-    "assets":  ["public/**/*", "data/.gitkeep"],
-    "targets": ["node18-win-x64", "node18-linux-x64"],
-    "scripts": ["dist/**/*.js"]
+    "better-sqlite3": "^9.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.13",
+    "stripe": "^15.7.0"
   }
 }
