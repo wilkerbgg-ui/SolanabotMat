@@ -17,9 +17,3 @@
     "stripe": "^15.7.0"
   }
 }
-```
-
-A mudança é só essa linha:
-```
-"node": ">=18.0.0"  ← antes (aceita v25)
-"node": "18.x"      ← agora (força Node 18)
