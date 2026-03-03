@@ -456,6 +456,7 @@ app.post('/api/stripe/checkout', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: plan === 'lifetime' ? 'payment' : 'subscription',
+      allow_promotion_codes: true,
       line_items: [{ price: priceMap[plan], quantity: 1 }],
       metadata: { price_id: priceMap[plan] },
       success_url: `${process.env.SITE_URL}/success.html`,
