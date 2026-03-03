@@ -2,15 +2,19 @@
 require('dotenv').config();
 
 const express    = require('express');
-const Database   = require('better-sqlite3');
+const { Pool }   = require('pg');
 const Stripe     = require('stripe');
 const nodemailer = require('nodemailer');
 const crypto     = require('crypto');
 
-const app = express();
-const db  = new Database('./licenses.db');
+const app  = express();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('render.com')
+    ? { rejectUnauthorized: false }
+    : false,
+});
 
-// Stripe iniciado lazy — só quando rotas de pagamento forem chamadas
 function getStripe() {
   if (!process.env.STRIPE_SECRET_KEY) throw new Error('STRIPE_SECRET_KEY não configurado');
   return new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -18,61 +22,63 @@ function getStripe() {
 
 // ─── Banco de dados ───────────────────────────────────────────────────────────
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL,
-    email      TEXT UNIQUE NOT NULL,
-    password   TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id         SERIAL PRIMARY KEY,
+      name       TEXT NOT NULL,
+      email      TEXT UNIQUE NOT NULL,
+      password   TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
 
-  CREATE TABLE IF NOT EXISTS licenses (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id           INTEGER,
-    key               TEXT UNIQUE NOT NULL,
-    email             TEXT NOT NULL,
-    plan              TEXT NOT NULL,
-    plan_name         TEXT NOT NULL,
-    status            TEXT DEFAULT 'active',
-    stripe_session_id TEXT,
-    created_at        TEXT DEFAULT (datetime('now')),
-    expires_at        TEXT,
-    last_seen         TEXT,
-    last_version      TEXT,
-    last_mode         TEXT,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
+    CREATE TABLE IF NOT EXISTS licenses (
+      id                SERIAL PRIMARY KEY,
+      user_id           INTEGER REFERENCES users(id),
+      key               TEXT UNIQUE NOT NULL,
+      email             TEXT NOT NULL,
+      plan              TEXT NOT NULL,
+      plan_name         TEXT NOT NULL,
+      status            TEXT DEFAULT 'active',
+      stripe_session_id TEXT,
+      created_at        TIMESTAMP DEFAULT NOW(),
+      expires_at        TIMESTAMP,
+      last_seen         TIMESTAMP,
+      last_version      TEXT,
+      last_mode         TEXT
+    );
 
-  CREATE TABLE IF NOT EXISTS telemetry (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_key         TEXT NOT NULL,
-    balance_usdc        REAL,
-    balance_sol         REAL,
-    capital_base        REAL,
-    profit_accumulated  REAL,
-    trades_total        INTEGER,
-    trades_won          INTEGER,
-    trades_today        INTEGER,
-    profit_today        REAL,
-    is_running          INTEGER,
-    mode                TEXT,
-    bot_version         TEXT,
-    rpc_status          TEXT,
-    circuit_breaker     INTEGER,
-    last_trade_at       TEXT,
-    recorded_at         TEXT DEFAULT (datetime('now'))
-  );
+    CREATE TABLE IF NOT EXISTS telemetry (
+      id                 SERIAL PRIMARY KEY,
+      license_key        TEXT NOT NULL,
+      balance_usdc       NUMERIC,
+      balance_sol        NUMERIC,
+      capital_base       NUMERIC,
+      profit_accumulated NUMERIC,
+      trades_total       INTEGER,
+      trades_won         INTEGER,
+      trades_today       INTEGER,
+      profit_today       NUMERIC,
+      is_running         BOOLEAN,
+      mode               TEXT,
+      bot_version        TEXT,
+      rpc_status         TEXT,
+      circuit_breaker    BOOLEAN,
+      last_trade_at      TIMESTAMP,
+      recorded_at        TIMESTAMP DEFAULT NOW()
+    );
 
-  CREATE TABLE IF NOT EXISTS activation_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_key TEXT,
-    action      TEXT,
-    ip          TEXT,
-    meta        TEXT,
-    ts          TEXT DEFAULT (datetime('now'))
-  );
-`);
+    CREATE TABLE IF NOT EXISTS activation_log (
+      id          SERIAL PRIMARY KEY,
+      license_key TEXT,
+      action      TEXT,
+      ip          TEXT,
+      meta        TEXT,
+      ts          TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('✅ Banco de dados inicializado');
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -98,7 +104,7 @@ function expiresAt(plan) {
   if (plan === 'quarterly')  d.setMonth(d.getMonth() + 3);
   if (plan === 'semiannual') d.setMonth(d.getMonth() + 6);
   if (plan === 'annual')     d.setFullYear(d.getFullYear() + 1);
-  return d.toISOString();
+  return d;
 }
 
 function planName(plan) {
@@ -126,13 +132,13 @@ function calcDaysLeft(exp) {
   return Math.ceil((new Date(exp) - new Date()) / 86_400_000);
 }
 
-// Token store em memória — expira em 24h (evita overflow do setTimeout)
+// Token store em memória — 24h
 const tokenStore = new Map();
 
 function createSession(userId) {
   const token = generateToken();
   tokenStore.set(token, userId);
-  setTimeout(() => tokenStore.delete(token), 24 * 60 * 60 * 1000); // 24h
+  setTimeout(() => tokenStore.delete(token), 24 * 60 * 60 * 1000);
   return token;
 }
 
@@ -147,10 +153,8 @@ async function sendKeyEmail(email, key, plan) {
     secure: false,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
-
   const label   = planName(plan);
-  const siteUrl = process.env.SITE_URL || 'https://taurus.enduranceserver.com.br';
-
+  const siteUrl = process.env.SITE_URL || 'https://cotam2.com';
   await transporter.sendMail({
     from: `SOL·ARB <${process.env.SMTP_USER}>`,
     to: email,
@@ -160,9 +164,7 @@ async function sendKeyEmail(email, key, plan) {
         <h2 style="margin:0 0 8px">SOL·ARB Arbitrage Bot</h2>
         <p style="color:#556677;margin:0 0 24px">Plano: <strong style="color:#fff">${label}</strong></p>
         <p style="color:#aabbcc;margin:0 0 8px">Sua chave de licença:</p>
-        <div style="background:#111;border:1px solid #00ff88;border-radius:8px;padding:18px;font-size:22px;letter-spacing:3px;text-align:center;color:#00ff88">
-          ${key}
-        </div>
+        <div style="background:#111;border:1px solid #00ff88;border-radius:8px;padding:18px;font-size:22px;letter-spacing:3px;text-align:center;color:#00ff88">${key}</div>
         <div style="background:#0d2a1a;border:1px solid #00ff8830;border-radius:8px;padding:20px;margin:24px 0;color:#aabbcc;font-size:14px;line-height:2">
           <strong style="color:#00ff88">📥 Como ativar:</strong><br>
           1. Baixe o <strong style="color:#fff">SOLARB.exe</strong> no site<br>
@@ -173,8 +175,7 @@ async function sendKeyEmail(email, key, plan) {
           6. Painel: <a href="${siteUrl}/dashboard.html" style="color:#00ff88">${siteUrl}/dashboard.html</a>
         </div>
         <p style="color:#334455;font-size:12px">Suporte: <a href="${siteUrl}" style="color:#00ff88">${siteUrl}</a></p>
-      </div>
-    `,
+      </div>`,
   });
 }
 
@@ -213,7 +214,7 @@ app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString
 
 // ─── AUTH: Register ───────────────────────────────────────────────────────────
 
-app.post('/auth/register', (req, res) => {
+app.post('/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password)
@@ -221,23 +222,28 @@ app.post('/auth/register', (req, res) => {
     if (password.length < 8)
       return res.status(400).json({ error: 'Senha deve ter mínimo 8 caracteres' });
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) return res.status(400).json({ error: 'Email já cadastrado' });
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0)
+      return res.status(400).json({ error: 'Email já cadastrado' });
 
-    const result = db.prepare('INSERT INTO users (name, email, password) VALUES (?,?,?)')
-      .run(name, email, hashPassword(password));
-    const userId = result.lastInsertRowid;
+    const result = await pool.query(
+      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
+      [name, email, hashPassword(password)]
+    );
+    const userId = result.rows[0].id;
     const token  = createSession(userId);
 
     // Vincula licença existente se comprou antes de criar conta
-    const license = db.prepare(
-      "SELECT * FROM licenses WHERE email = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1"
-    ).get(email);
+    const licResult = await pool.query(
+      "SELECT * FROM licenses WHERE email = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      [email]
+    );
+    const license = licResult.rows[0] || null;
     if (license && !license.user_id) {
-      db.prepare('UPDATE licenses SET user_id = ? WHERE id = ?').run(userId, license.id);
+      await pool.query('UPDATE licenses SET user_id = $1 WHERE id = $2', [userId, license.id]);
     }
 
-    res.json({ token, user: { id: userId, name, email }, license: license || null });
+    res.json({ token, user: { id: userId, name, email }, license });
   } catch (err) {
     console.error('Register error:', err.message);
     res.status(500).json({ error: 'Erro interno no servidor' });
@@ -246,22 +252,25 @@ app.post('/auth/register', (req, res) => {
 
 // ─── AUTH: Login ──────────────────────────────────────────────────────────────
 
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ error: 'Preencha email e senha' });
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const user   = result.rows[0];
     if (!user || user.password !== hashPassword(password))
       return res.status(401).json({ error: 'Email ou senha incorretos' });
 
-    const token   = createSession(user.id);
-    const license = db.prepare(
-      "SELECT * FROM licenses WHERE (user_id = ? OR email = ?) AND status = 'active' ORDER BY created_at DESC LIMIT 1"
-    ).get(user.id, email);
+    const token = createSession(user.id);
+    const licResult = await pool.query(
+      "SELECT * FROM licenses WHERE (user_id = $1 OR email = $2) AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      [user.id, email]
+    );
+    const license = licResult.rows[0] || null;
 
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email }, license: license || null });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email }, license });
   } catch (err) {
     console.error('Login error:', err.message);
     res.status(500).json({ error: 'Erro interno no servidor' });
@@ -270,16 +279,17 @@ app.post('/auth/login', (req, res) => {
 
 // ─── AUTH: Me ─────────────────────────────────────────────────────────────────
 
-app.get('/auth/me', authMiddleware, (req, res) => {
+app.get('/auth/me', authMiddleware, async (req, res) => {
   try {
-    const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.userId);
+    const result = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.userId]);
+    const user   = result.rows[0];
     if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-    const license = db.prepare(
-      "SELECT * FROM licenses WHERE (user_id = ? OR email = ?) AND status = 'active' ORDER BY created_at DESC LIMIT 1"
-    ).get(user.id, user.email);
-
-    res.json({ user, license: license || null });
+    const licResult = await pool.query(
+      "SELECT * FROM licenses WHERE (user_id = $1 OR email = $2) AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      [user.id, user.email]
+    );
+    res.json({ user, license: licResult.rows[0] || null });
   } catch (err) {
     console.error('Me error:', err.message);
     res.status(500).json({ error: 'Erro interno no servidor' });
@@ -288,26 +298,32 @@ app.get('/auth/me', authMiddleware, (req, res) => {
 
 // ─── TELEMETRY: My ───────────────────────────────────────────────────────────
 
-app.get('/telemetry/my', authMiddleware, (req, res) => {
+app.get('/telemetry/my', authMiddleware, async (req, res) => {
   try {
-    const user = db.prepare('SELECT email FROM users WHERE id = ?').get(req.userId);
+    const userResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.userId]);
+    const user = userResult.rows[0];
     if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-    const license = db.prepare(
-      "SELECT key FROM licenses WHERE (user_id = ? OR email = ?) AND status = 'active' ORDER BY created_at DESC LIMIT 1"
-    ).get(req.userId, user.email);
-
+    const licResult = await pool.query(
+      "SELECT key FROM licenses WHERE (user_id = $1 OR email = $2) AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      [req.userId, user.email]
+    );
+    const license = licResult.rows[0];
     if (!license) return res.json({ telemetry: null, history: [] });
 
-    const telemetry = db.prepare(
-      'SELECT * FROM telemetry WHERE license_key = ? ORDER BY recorded_at DESC LIMIT 1'
-    ).get(license.key);
+    const telResult = await pool.query(
+      'SELECT * FROM telemetry WHERE license_key = $1 ORDER BY recorded_at DESC LIMIT 1',
+      [license.key]
+    );
+    const histResult = await pool.query(
+      'SELECT balance_usdc, recorded_at FROM telemetry WHERE license_key = $1 ORDER BY recorded_at DESC LIMIT 360',
+      [license.key]
+    );
 
-    const history = db.prepare(
-      'SELECT balance_usdc, recorded_at FROM telemetry WHERE license_key = ? ORDER BY recorded_at DESC LIMIT 360'
-    ).all(license.key).reverse();
-
-    res.json({ telemetry, history });
+    res.json({
+      telemetry: telResult.rows[0] || null,
+      history:   histResult.rows.reverse(),
+    });
   } catch (err) {
     console.error('Telemetry/my error:', err.message);
     res.status(500).json({ error: 'Erro interno no servidor' });
@@ -316,22 +332,25 @@ app.get('/telemetry/my', authMiddleware, (req, res) => {
 
 // ─── LICENSE: Validate ────────────────────────────────────────────────────────
 
-app.post('/license/validate', (req, res) => {
+app.post('/license/validate', async (req, res) => {
   try {
     const { key, bot_version, mode } = req.body;
     if (!key) return res.json({ valid: false, error: 'Missing key' });
 
-    const lic = db.prepare('SELECT * FROM licenses WHERE key = ?').get(key);
+    const result = await pool.query('SELECT * FROM licenses WHERE key = $1', [key]);
+    const lic    = result.rows[0];
     if (!lic) return res.json({ valid: false, error: 'Key not found' });
     if (lic.status !== 'active') return res.json({ valid: false, error: `License ${lic.status}` });
 
     if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
-      db.prepare("UPDATE licenses SET status = 'expired' WHERE key = ?").run(key);
+      await pool.query("UPDATE licenses SET status = 'expired' WHERE key = $1", [key]);
       return res.json({ valid: false, error: 'License expired' });
     }
 
-    db.prepare("UPDATE licenses SET last_seen = datetime('now'), last_version = ?, last_mode = ? WHERE key = ?")
-      .run(bot_version || null, mode || null, key);
+    await pool.query(
+      'UPDATE licenses SET last_seen = NOW(), last_version = $1, last_mode = $2 WHERE key = $3',
+      [bot_version || null, mode || null, key]
+    );
 
     const days    = calcDaysLeft(lic.expires_at);
     const warning = days !== null && days <= 7
@@ -354,20 +373,21 @@ app.post('/license/validate', (req, res) => {
 
 // ─── LICENSE: Heartbeat ───────────────────────────────────────────────────────
 
-app.post('/license/heartbeat', (req, res) => {
+app.post('/license/heartbeat', async (req, res) => {
   try {
     const { key } = req.body;
     if (!key) return res.json({ shutdown: false });
 
-    const lic = db.prepare('SELECT * FROM licenses WHERE key = ?').get(key);
+    const result = await pool.query('SELECT * FROM licenses WHERE key = $1', [key]);
+    const lic    = result.rows[0];
     if (!lic || lic.status !== 'active') return res.json({ shutdown: true });
 
     if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
-      db.prepare("UPDATE licenses SET status = 'expired' WHERE key = ?").run(key);
+      await pool.query("UPDATE licenses SET status = 'expired' WHERE key = $1", [key]);
       return res.json({ shutdown: true });
     }
 
-    db.prepare("UPDATE licenses SET last_seen = datetime('now') WHERE key = ?").run(key);
+    await pool.query('UPDATE licenses SET last_seen = NOW() WHERE key = $1', [key]);
     res.json({ shutdown: false });
   } catch (err) {
     res.json({ shutdown: false });
@@ -376,7 +396,7 @@ app.post('/license/heartbeat', (req, res) => {
 
 // ─── TELEMETRY: Update ────────────────────────────────────────────────────────
 
-app.post('/telemetry/update', (req, res) => {
+app.post('/telemetry/update', async (req, res) => {
   try {
     const {
       key, balance_usdc, balance_sol, capital_base, profit_accumulated,
@@ -386,28 +406,30 @@ app.post('/telemetry/update', (req, res) => {
 
     if (!key) return res.json({ ok: false, error: 'Missing key' });
 
-    const lic = db.prepare("SELECT id FROM licenses WHERE key = ? AND status = 'active'").get(key);
-    if (!lic) return res.json({ ok: false, error: 'Invalid key' });
+    const licResult = await pool.query(
+      "SELECT id FROM licenses WHERE key = $1 AND status = 'active'", [key]
+    );
+    if (licResult.rows.length === 0) return res.json({ ok: false, error: 'Invalid key' });
 
-    db.prepare(`
+    await pool.query(`
       INSERT INTO telemetry
         (license_key, balance_usdc, balance_sol, capital_base, profit_accumulated,
          trades_total, trades_won, trades_today, profit_today,
          is_running, mode, bot_version, rpc_status, circuit_breaker, last_trade_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    `, [
       key, balance_usdc, balance_sol, capital_base, profit_accumulated,
       trades_total, trades_won, trades_today, profit_today,
-      is_running ? 1 : 0, mode, bot_version, rpc_status,
-      circuit_breaker ? 1 : 0, last_trade_at
-    );
+      is_running, mode, bot_version, rpc_status, circuit_breaker,
+      last_trade_at || null,
+    ]);
 
-    // Mantém últimas 1440 entradas (~1 dia)
-    db.prepare(`
-      DELETE FROM telemetry WHERE license_key = ? AND id NOT IN (
-        SELECT id FROM telemetry WHERE license_key = ? ORDER BY recorded_at DESC LIMIT 1440
+    // Mantém últimas 1440 entradas por key
+    await pool.query(`
+      DELETE FROM telemetry WHERE license_key = $1 AND id NOT IN (
+        SELECT id FROM telemetry WHERE license_key = $1 ORDER BY recorded_at DESC LIMIT 1440
       )
-    `).run(key, key);
+    `, [key]);
 
     res.json({ ok: true });
   } catch (err) {
@@ -429,7 +451,6 @@ app.post('/api/stripe/checkout', async (req, res) => {
       annual:     process.env.STRIPE_PRICE_ANNUAL,
       lifetime:   process.env.STRIPE_PRICE_LIFETIME,
     };
-
     if (!priceMap[plan]) return res.status(400).json({ error: 'Plano inválido' });
 
     const session = await stripe.checkout.sessions.create({
@@ -440,7 +461,6 @@ app.post('/api/stripe/checkout', async (req, res) => {
       success_url: `${process.env.SITE_URL}/success.html`,
       cancel_url:  `${process.env.SITE_URL}/#planos`,
     });
-
     res.json({ url: session.url });
   } catch (err) {
     console.error('Stripe checkout error:', err.message);
@@ -454,12 +474,9 @@ app.post('/api/stripe/webhook', async (req, res) => {
   try {
     const stripe = getStripe();
     let event;
-
     try {
       event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers['stripe-signature'],
-        process.env.STRIPE_WEBHOOK_SECRET
+        req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -471,15 +488,16 @@ app.post('/api/stripe/webhook', async (req, res) => {
       const plan    = planFromPriceId(session.metadata?.price_id);
       const key     = generateKey();
 
-      // Evita duplicata
-      if (db.prepare('SELECT id FROM licenses WHERE stripe_session_id = ?').get(session.id)) {
-        return res.json({ received: true });
-      }
+      const dup = await pool.query('SELECT id FROM licenses WHERE stripe_session_id = $1', [session.id]);
+      if (dup.rows.length > 0) return res.json({ received: true });
 
-      const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+      const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+      const userId     = userResult.rows[0]?.id || null;
 
-      db.prepare('INSERT INTO licenses (user_id, key, email, plan, plan_name, expires_at, stripe_session_id) VALUES (?,?,?,?,?,?,?)')
-        .run(user?.id || null, key, email, plan, planName(plan), expiresAt(plan), session.id);
+      await pool.query(
+        'INSERT INTO licenses (user_id, key, email, plan, plan_name, expires_at, stripe_session_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [userId, key, email, plan, planName(plan), expiresAt(plan), session.id]
+      );
 
       try {
         await sendKeyEmail(email, key, plan);
@@ -490,11 +508,10 @@ app.post('/api/stripe/webhook', async (req, res) => {
     }
 
     if (event.type === 'customer.subscription.deleted') {
-      const lic = db.prepare('SELECT * FROM licenses WHERE stripe_session_id = ?').get(event.data.object.id);
-      if (lic) {
-        db.prepare("UPDATE licenses SET status = 'suspended' WHERE key = ?").run(lic.key);
-        console.log(`⛔ Licença suspensa: ${lic.key}`);
-      }
+      await pool.query(
+        "UPDATE licenses SET status = 'suspended' WHERE stripe_session_id = $1",
+        [event.data.object.id]
+      );
     }
 
     res.json({ received: true });
@@ -506,66 +523,73 @@ app.post('/api/stripe/webhook', async (req, res) => {
 
 // ─── ADMIN ────────────────────────────────────────────────────────────────────
 
-app.get('/api/admin/licenses', adminAuth, (req, res) => {
-  try {
-    res.json(db.prepare('SELECT * FROM licenses ORDER BY created_at DESC').all());
-  } catch (err) { res.status(500).json({ error: err.message }); }
+app.get('/api/admin/licenses', adminAuth, async (req, res) => {
+  try { res.json((await pool.query('SELECT * FROM licenses ORDER BY created_at DESC')).rows); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/users', adminAuth, (req, res) => {
-  try {
-    res.json(db.prepare('SELECT id, name, email, created_at FROM users ORDER BY created_at DESC').all());
-  } catch (err) { res.status(500).json({ error: err.message }); }
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try { res.json((await pool.query('SELECT id, name, email, created_at FROM users ORDER BY created_at DESC')).rows); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/telemetry/:key', adminAuth, (req, res) => {
-  try {
-    res.json(db.prepare('SELECT * FROM telemetry WHERE license_key = ? ORDER BY recorded_at DESC LIMIT 200').all(req.params.key));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+app.get('/api/admin/telemetry/:key', adminAuth, async (req, res) => {
+  try { res.json((await pool.query('SELECT * FROM telemetry WHERE license_key = $1 ORDER BY recorded_at DESC LIMIT 200', [req.params.key])).rows); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/logs', adminAuth, (req, res) => {
-  try {
-    res.json(db.prepare('SELECT * FROM activation_log ORDER BY ts DESC LIMIT 500').all());
-  } catch (err) { res.status(500).json({ error: err.message }); }
+app.get('/api/admin/logs', adminAuth, async (req, res) => {
+  try { res.json((await pool.query('SELECT * FROM activation_log ORDER BY ts DESC LIMIT 500')).rows); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/revoke', adminAuth, (req, res) => {
+app.post('/api/admin/revoke', adminAuth, async (req, res) => {
   try {
     if (!req.body.key) return res.status(400).json({ error: 'Missing key' });
-    db.prepare("UPDATE licenses SET status = 'suspended' WHERE key = ?").run(req.body.key);
+    await pool.query("UPDATE licenses SET status = 'suspended' WHERE key = $1", [req.body.key]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/reactivate', adminAuth, (req, res) => {
+app.post('/api/admin/reactivate', adminAuth, async (req, res) => {
   try {
     if (!req.body.key) return res.status(400).json({ error: 'Missing key' });
-    db.prepare("UPDATE licenses SET status = 'active' WHERE key = ?").run(req.body.key);
+    await pool.query("UPDATE licenses SET status = 'active' WHERE key = $1", [req.body.key]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/create-manual', adminAuth, (req, res) => {
+app.post('/api/admin/create-manual', adminAuth, async (req, res) => {
   try {
     const { email, plan } = req.body;
     if (!email || !plan) return res.status(400).json({ error: 'Missing email or plan' });
-    const key  = generateKey();
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    db.prepare('INSERT INTO licenses (user_id, key, email, plan, plan_name, expires_at) VALUES (?,?,?,?,?,?)')
-      .run(user?.id || null, key, email, plan, planName(plan), expiresAt(plan));
+    const key        = generateKey();
+    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const userId     = userResult.rows[0]?.id || null;
+    const exp        = expiresAt(plan);
+    await pool.query(
+      'INSERT INTO licenses (user_id, key, email, plan, plan_name, expires_at) VALUES ($1,$2,$3,$4,$5,$6)',
+      [userId, key, email, plan, planName(plan), exp]
+    );
     console.log(`🔧 Licença manual [${plan}] ${email} → ${key}`);
-    res.json({ ok: true, key, expires_at: expiresAt(plan) });
+    res.json({ ok: true, key, expires_at: exp });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, () => {
-  console.log(`🔑 SOL·ARB Server na porta ${PORT}`);
-  console.log(`   Site:   ${process.env.SITE_URL        || '⚠️  não configurado'}`);
-  console.log(`   Stripe: ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌ faltando'}`);
-  console.log(`   Email:  ${process.env.SMTP_USER          ? '✅' : '❌ faltando'}`);
-  console.log(`   Admin:  ${process.env.ADMIN_TOKEN         ? '✅' : '❌ faltando'}`);
+
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🔑 SOL·ARB Server na porta ${PORT}`);
+    console.log(`   Site:   ${process.env.SITE_URL         || '⚠️  não configurado'}`);
+    console.log(`   Stripe: ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌ faltando'}`);
+    console.log(`   Email:  ${process.env.SMTP_USER          ? '✅' : '❌ faltando'}`);
+    console.log(`   Admin:  ${process.env.ADMIN_TOKEN         ? '✅' : '❌ faltando'}`);
+    console.log(`   DB:     ${process.env.DATABASE_URL         ? '✅ PostgreSQL' : '❌ faltando'}`);
+  });
+}).catch(err => {
+  console.error('❌ Falha ao inicializar banco:', err.message);
+  process.exit(1);
 });
