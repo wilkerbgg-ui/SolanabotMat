@@ -1,7 +1,7 @@
 {
   "name": "solarb-license-server",
-  "version": "1.0.0",
-  "description": "SOL·ARB License, Telemetry and Payments Server",
+  "version": "2.0.0",
+  "description": "SOL·ARB License, Auth, Telemetry and Payments Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
