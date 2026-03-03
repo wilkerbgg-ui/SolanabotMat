@@ -1,19 +1,20 @@
 {
   "name": "solarb-license-server",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "SOL·ARB License, Auth, Telemetry and Payments Server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "engines": {
     "node": "18.x"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "nodemailer": "^6.9.13",
+    "pg": "^8.11.3",
     "stripe": "^15.7.0"
   }
 }
